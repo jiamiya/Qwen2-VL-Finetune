@@ -14,7 +14,7 @@ NUM_DEVICES=1
 GRAD_ACCUM_STEPS=$((GLOBAL_BATCH_SIZE / (BATCH_PER_DEVICE * NUM_DEVICES)))
 
 # If you want to tune the `embed_token` with LoRA, You need to tune `lm_head` together
-deepspeed --num_gpus=1 src/train/train_sft.py \
+deepspeed --num_gpus=1 src/train/train_vla.py \
     --use_liger True \
     --lora_enable True \
     --use_dora False \
@@ -25,7 +25,7 @@ deepspeed --num_gpus=1 src/train/train_sft.py \
     --num_lora_modules -1 \
     --deepspeed scripts/zero3_offload.json \
     --model_id $MODEL_NAME \
-    --data_path /home/jmy/projects/LLaDA-AV-main/data/nuscenes_drive_data_single_image_train_v2.json \
+    --data_path /home/jmy/projects/LLaDA-AV-main/data/nuscenes_drive_data_single_image_train_vla.json \
     --image_folder /mnt/pool/Datasets/nuScene/samples/CAM_FRONT \
     --remove_unused_columns False \
     --freeze_vision_tower False \
@@ -34,7 +34,7 @@ deepspeed --num_gpus=1 src/train/train_sft.py \
     --bf16 True \
     --fp16 False \
     --disable_flash_attn2 False \
-    --output_dir output/testing_lora_qwen25 \
+    --output_dir output/testing_lora_qwen25vla \
     --num_train_epochs 1 \
     --per_device_train_batch_size $BATCH_PER_DEVICE \
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \

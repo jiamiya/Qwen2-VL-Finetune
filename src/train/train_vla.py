@@ -5,10 +5,12 @@ os.environ["CUDA_VISIBLE_DEVICES"] = '5'
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  
 import torch
 from peft import LoraConfig, get_peft_model
+from peft.tuners.lora import LoraLayer
 import ast
 from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2VLForConditionalGeneration, HfArgumentParser, Qwen2_5_VLForConditionalGeneration
+from src.model.qwen2_5_vla import QwenVLAWrapper
 from src.trainer import QwenSFTTrainer
-from src.dataset import make_supervised_data_module
+from src.dataset import make_supervised_vla_data_module
 from src.params import DataArguments, ModelArguments, TrainingArguments
 from train.train_utils import get_peft_state_maybe_zero_3, get_peft_state_non_lora_maybe_zero_3, safe_save_model_for_hf_trainer
 import pathlib
@@ -121,89 +123,134 @@ def train():
             )
         ))
 
-    if "Qwen2.5" in model_args.model_id:
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_args.model_id,
-            torch_dtype=compute_dtype,
-            attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa", 
-            **bnb_model_from_pretrained_args
-        )
-    else:
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_args.model_id,
-            torch_dtype=compute_dtype,
-            attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa", 
-            **bnb_model_from_pretrained_args
-        )
+    # ==========================================================
+    # 1) 构建包装后的模型 —— 直接用 from_pretrained（无需自己实现）
+    #    这里把 action 相关的超参从 ModelArguments 里取（若无则用默认）
+    # ==========================================================
+    wrapper_kwargs = dict(
+        num_action_tokens=getattr(model_args, "num_action_tokens", 10),   # 预测步数 N
+        action_dim=getattr(model_args, "action_dim", 2),                  # 动作维度 A（如 [speed, curvature]）
+        # action_low=getattr(model_args, "action_low", [-10.0, -1.0]),
+        # action_high=getattr(model_args, "action_high", [10.0, 1.0]),
+        # lm_loss_weight=getattr(model_args, "lm_loss_weight", 0.0),        # 只训 action 时设为 0
+        # action_loss_weight=getattr(model_args, "action_loss_weight", 1.0),
+    )
 
+    model = QwenVLAWrapper.from_pretrained(
+        model_args.model_id,
+        torch_dtype=compute_dtype,
+        attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa",
+        **bnb_model_from_pretrained_args,
+        **wrapper_kwargs,
+    )
+
+    # 训练时禁用 KV cache
     model.config.use_cache = False
+
+    # 按你原逻辑配置 LLM 与 vision
     model_to_configure = model
     configure_llm(model_to_configure, training_args)
     configure_vision_tower(model_to_configure, training_args, compute_dtype, training_args.device)
 
-    if training_args.bits in [4,8]:
-        model.config.torch_dtype = (torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+    # k-bit 训练前准备
+    if training_args.bits in [4, 8]:
+        model.config.torch_dtype = (
+            torch.float32 if training_args.fp16 else
+            (torch.bfloat16 if training_args.bf16 else torch.float32)
+        )
         from peft import prepare_model_for_kbit_training
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing, gradient_checkpointing_kwargs={"use_reentrant": True})
-    
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=training_args.gradient_checkpointing,
+            gradient_checkpointing_kwargs={"use_reentrant": True}
+        )
+
     if training_args.gradient_checkpointing:
         model.enable_input_require_grads()
         training_args.gradient_checkpointing_kwargs = {"use_reentrant": True}
 
+    # ==========================================================
+    # 2) 应用 LoRA；只训练 LoRA + action_*，其余冻结
+    # ==========================================================
     if training_args.lora_enable:
-        lora_namespan_exclude = training_args.lora_namespan_exclude
+        # 确保 action_head 不会被 LoRA 化（全参训练它）
+        lora_namespan_exclude = list(set(list(training_args.lora_namespan_exclude) + ["action_head"]))
+
         peft_config = LoraConfig(
             r=training_args.lora_rank,
             lora_alpha=training_args.lora_alpha,
-            target_modules=find_target_linear_names(model, lora_namespan_exclude=lora_namespan_exclude, num_lora_modules=training_args.num_lora_modules),
+            target_modules=find_target_linear_names(
+                model,
+                lora_namespan_exclude=lora_namespan_exclude,
+                num_lora_modules=training_args.num_lora_modules
+            ),
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias
         )
+
         if training_args.bits == 16:
             if training_args.bf16:
                 model.to(torch.bfloat16)
             if training_args.fp16:
                 model.to(torch.float16)
+
         rank0_print("Adding LoRA to the model...")
         model = get_peft_model(model, peft_config)
 
-        # Peft maodel makes vision tower and merger freezed again.
-        # Configuring fuction could be called here, but sometimes it does not work properly.
-        # So I just made it this way.
-        # Need to be fixed in the future.
-
+        # LoRA 包装后，某些参数（视觉/merger）会被重新冻结；按原逻辑处理
         if not training_args.freeze_vision_tower:
             for name, param in model.named_parameters():
                 if "visual" in name:
                     param.requires_grad = True
-
         if not training_args.freeze_merger:
             for name, param in model.named_parameters():
                 if "merger" in name:
                     param.requires_grad = True
 
-    processor = AutoProcessor.from_pretrained(model_args.model_id)
+        # —— 关键：显式解冻 action_token_embeds 与 action_head（参与训练）
+        for name, p in model.named_parameters():
+            if ("action_token_embeds" in name) or ("action_head" in name):
+                p.requires_grad = True
 
-    # model.config.tokenizer_model_max_length = processor.tokenizer.model_max_length
-
+    # 处理量化/精度下的模块 dtype（沿用原逻辑，并确保 action_head dtype 正确）
     if training_args.bits in [4, 8]:
-        from peft.tuners.lora import LoraLayer
         for name, module in model.named_modules():
             if isinstance(module, LoraLayer):
                 if training_args.bf16:
                     module = module.to(torch.bfloat16)
             if 'norm' in name:
                 module = module.to(torch.float32)
-            
             if 'lm_head' in name or 'embed_token' in name:
                 if hasattr(module, 'weight'):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
-    data_module = make_supervised_data_module(model_id=model_args.model_id,
-                                              processor=processor,
-                                              data_args=data_args)
+        # 把 action_head 调到一致 dtype
+        act_dtype = torch.bfloat16 if training_args.bf16 else (torch.float16 if training_args.fp16 else torch.float32)
+        for name, module in model.named_modules():
+            if name.startswith("action_head") or ".action_head" in name:
+                try:
+                    module.to(act_dtype)
+                except Exception:
+                    pass
 
+    # check trainable parameters
+    trainable = [(n, p.requires_grad, tuple(p.shape)) for n, p in model.named_parameters() if p.requires_grad]
+    print(f"#trainable params: {sum(p.numel() for _, p in trainable):,}")
+
+    # ==========================================================
+    # 3) 数据与 Trainer（保持原逻辑）
+    #    —— 前提： Dataset/Collator 已经产出 action_targets / action_mask
+    # ==========================================================
+    processor = AutoProcessor.from_pretrained(model_args.model_id)
+
+    data_module = make_supervised_vla_data_module(
+        model_id=model_args.model_id,
+        processor=processor,
+        data_args=data_args
+    )
+
+    from src.trainer import QwenSFTTrainer  # 你的自定义 Trainer
     trainer = QwenSFTTrainer(
         model=model,
         processing_class=processor,
@@ -218,17 +265,20 @@ def train():
 
     trainer.save_state()
 
+    # 训练结束恢复 use_cache（按原逻辑）
     model.config.use_cache = True
-    
+
+    # ==========================================================
+    # 4) 保存（LoRA & 非 LoRA 可训练参数分开保存）—— 保持原逻辑
+    #     action_* 参数会进入 non_lora_state_dict.bin
+    # ==========================================================
     if training_args.lora_enable:
         state_dict = get_peft_state_maybe_zero_3(
             model.named_parameters(), training_args.lora_bias
         )
-
         non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
             model.named_parameters(), require_grad_only=True
         )
-
         if local_rank == 0 or local_rank == -1:
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)

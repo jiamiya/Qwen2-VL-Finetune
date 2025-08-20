@@ -22,7 +22,7 @@ class DPODataset(Dataset):
 
     def __init__(
         self,
-        data_path: str | list,
+        data_path: str,
         processor: transformers.ProcessorMixin,
         data_args: DataArguments,
         model_id,

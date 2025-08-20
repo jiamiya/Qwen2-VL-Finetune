@@ -20,7 +20,7 @@ from .data_utils import get_image_info, get_video_info, llava_to_openai, pad_seq
 
 
 
-class SupervisedDataset(Dataset):
+class SupervisedVLADataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
     def __init__(
@@ -31,7 +31,7 @@ class SupervisedDataset(Dataset):
         model_id,
         padding=True,
     ):
-        super(SupervisedDataset, self).__init__()
+        super(SupervisedVLADataset, self).__init__()
         if isinstance(data_path, str):
             list_data_dict = json.load(open(data_path, "r"))
         else:
@@ -187,10 +187,27 @@ class SupervisedDataset(Dataset):
         if len(all_second_gird) > 0:
             second_gird = all_second_gird
             data_dict["second_per_grid_ts"] = second_gird
+            
+        # ====== 新增：数值动作监督 ======
+        # expect sources 里含有 "action_targets": list[list[float]]，以及可选的 "action_mask": list[int/bool]
+        if "action_targets" in self.list_data_dict[i]:
+            at = self.list_data_dict[i]["action_targets"]  # list of [A]
+            action_targets = torch.tensor(at, dtype=torch.float32)  # [N, A]
+            data_dict["action_targets"] = action_targets
+
+            if "action_mask" in self.list_data_dict[i]:
+                am = self.list_data_dict[i]["action_mask"]
+                action_mask = torch.tensor(am, dtype=torch.bool)      # [N]
+            else:
+                action_mask = torch.ones((action_targets.shape[0],), dtype=torch.bool)
+
+            data_dict["action_mask"] = action_mask
+        # =================================
+
         
         return data_dict
 
-class DataCollatorForSupervisedDataset(object):
+class DataCollatorForSupervisedVLADataset(object):
     """Collate examples for supervised fine-tuning."""
 
     def __init__(self, pad_token_id: int):
@@ -204,7 +221,12 @@ class DataCollatorForSupervisedDataset(object):
         batch_video_thw = []
         batch_image_thw = []
         batch_second_per_grid_ts = []
-        
+
+        # 新增收集容器
+        batch_action_targets = []
+        batch_action_masks = []
+        action_A = None
+
         for example in examples:
             keys = example.keys()
             if "pixel_values_videos" in keys:
@@ -213,17 +235,28 @@ class DataCollatorForSupervisedDataset(object):
             elif "pixel_values" in keys:
                 batch_pixel_values.append(example["pixel_values"])
                 batch_image_thw.append(example["image_grid_thw"])
-            
+
             batch_input_ids.append(example["input_ids"])
             batch_label_ids.append(example["labels"])
 
             if "second_per_grid_ts" in keys:
                 batch_second_per_grid_ts.extend(example["second_per_grid_ts"])
-        
+
+            # ====== 新增：动作监督收集 ======
+            if "action_targets" in keys:
+                at = example["action_targets"]        # [N, A]
+                am = example.get("action_mask", None)  # [N] or None
+                batch_action_targets.append(at)
+                if am is None:
+                    am = torch.ones((at.shape[0],), dtype=torch.bool)
+                batch_action_masks.append(am)
+                if action_A is None:
+                    action_A = at.shape[-1]
+            # =================================
+
         input_ids = pad_sequence(
             batch_input_ids, padding_side='right', padding_value=self.pad_token_id
         )
-
         attention_mask = input_ids != self.pad_token_id
         labels = pad_sequence(batch_label_ids, padding_side='right', padding_value=IGNORE_INDEX)
 
@@ -248,14 +281,33 @@ class DataCollatorForSupervisedDataset(object):
         if len(batch_second_per_grid_ts) > 0:
             data_dict["second_per_grid_ts"] = batch_second_per_grid_ts
 
+        # ====== 新增：动作监督 padding ======
+        if len(batch_action_targets) > 0:
+            B = len(batch_action_targets)
+            Nmax = max(at.shape[0] for at in batch_action_targets)
+            A = action_A if action_A is not None else batch_action_targets[0].shape[-1]
+
+            ats = torch.zeros(B, Nmax, A, dtype=torch.float32)
+            msk = torch.zeros(B, Nmax, dtype=torch.bool)
+
+            for i in range(B):
+                n = batch_action_targets[i].shape[0]
+                ats[i, :n] = batch_action_targets[i]
+                msk[i, :n] = batch_action_masks[i]
+
+            data_dict["action_targets"] = ats      # [B, Nmax, A]
+            data_dict["action_mask"] = msk         # [B, Nmax]
+        # =====================================
+
         return data_dict
+
     
-def make_supervised_data_module(model_id, processor, data_args):
+def make_supervised_vla_data_module(model_id, processor, data_args):
     """Make dataset and collator for supervised fine-tuning."""
-    sft_dataset = SupervisedDataset(
+    sft_dataset = SupervisedVLADataset(
         data_path=data_args.data_path, processor=processor, data_args=data_args, model_id=model_id
     )
-    data_collator = DataCollatorForSupervisedDataset(pad_token_id=processor.tokenizer.pad_token_id)
+    data_collator = DataCollatorForSupervisedVLADataset(pad_token_id=processor.tokenizer.pad_token_id)
 
     return dict(train_dataset=sft_dataset,
                 eval_dataset=None,
