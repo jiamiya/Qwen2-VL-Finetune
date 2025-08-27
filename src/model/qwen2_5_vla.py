@@ -5,17 +5,19 @@ from dataclasses import dataclass
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from typing import Optional, List, Tuple, Union
 
+from .waypoint_encoder import WaypointDiffNormCoder, WaypointRangeNormCoder
+
 @dataclass
 class VLAOutputWithPast(CausalLMOutputWithPast):
     rope_deltas: Optional[torch.Tensor] = None
     action_hidden_states: Optional[torch.FloatTensor] = None  # [B, N, H]
     # Added
-    action_preds: Optional[torch.Tensor] = None,            # [B, N, A]
-    action_loss: Optional[torch.Tensor] = None,              # 标量
-    lm_loss: Optional[torch.Tensor] = None,       
+    action_preds: Optional[torch.Tensor] = None            # [B, N, A]
+    action_loss: Optional[torch.Tensor] = None              # 标量
+    lm_loss: Optional[torch.Tensor] = None       
 
 class QwenVLAWrapper(Qwen2_5_VLForConditionalGeneration):
-    def __init__(self, config, num_action_tokens: int = 10, action_dim: int = 2, return_action_states: bool = True):
+    def __init__(self, config, num_action_tokens: int = 10, action_dim: int = 2, return_action_states: bool = True, use_waypoint_encoder: bool = True):
         super().__init__(config)
         self.num_action_tokens = num_action_tokens
         self.action_dim = action_dim
@@ -28,8 +30,6 @@ class QwenVLAWrapper(Qwen2_5_VLForConditionalGeneration):
         )
         
         self.action_use_tanh = True
-        self.action_low = -torch.ones(action_dim, dtype=torch.float)*5 # TODO: set the action space for normalize
-        self.action_high = torch.ones(action_dim, dtype=torch.float)*5
 
         self.lm_loss_weight = 1.0
         self.action_loss_weight = 1.0
@@ -42,6 +42,11 @@ class QwenVLAWrapper(Qwen2_5_VLForConditionalGeneration):
                 torch.randn(num_action_tokens, hidden_size) * 0.02
             )
         self._last_action_states = None  # 便于 generate 增量阶段外部取用
+        
+        self.use_waypoint_encoder = use_waypoint_encoder
+        if self.use_waypoint_encoder:
+            # self.waypoint_encoder = WaypointDiffNormCoder()
+            self.waypoint_encoder = WaypointRangeNormCoder()
 
     @torch.no_grad()
     def _build_inputs_embeds(
@@ -243,11 +248,7 @@ class QwenVLAWrapper(Qwen2_5_VLForConditionalGeneration):
                 action_preds = self.action_head(action_states)
 
                 if self.action_use_tanh:
-                    # [-1,1] -> [low, high]
-                    mid  = (self.action_high + self.action_low) / 2.0
-                    half = (self.action_high - self.action_low) / 2.0
-                    # 广播到 [B, N, A]
-                    action_preds = torch.tanh(action_preds) * half + mid
+                    action_preds = torch.tanh(action_preds)
 
                 # —— 动作监督（可选） —— #
                 if action_targets is not None:
@@ -262,18 +263,48 @@ class QwenVLAWrapper(Qwen2_5_VLForConditionalGeneration):
                     mask_t = action_mask.unsqueeze(-1)
 
                     if self.action_loss_type == "mse":
-                        per_elem = (action_preds - action_targets) ** 2
+                        if not self.use_waypoint_encoder:
+                            per_elem = (action_preds - action_targets) ** 2
+                        else:
+                            action_preds_normed = action_preds # we expect the network output is the action value between [-1, 1]
+                            action_targets_normed = self.waypoint_encoder.encode(action_targets)
+                            # print('action normed: ', action_preds_normed)
+                            # print('action_targets_normed: ', action_targets_normed)
+                            per_elem = (action_preds_normed - action_targets_normed) ** 2 # L2 loss on normalized action
+                            action_preds = self.waypoint_encoder.decode(action_preds_normed) # denomarlize the action for real action
                     elif self.action_loss_type == "l1":
-                        per_elem = (action_preds - action_targets).abs()
+                        if not self.use_waypoint_encoder:
+                            per_elem = (action_preds - action_targets).abs()
+                        else:
+                            action_preds_normed = action_preds # we expect the network output is the action value between [-1, 1]
+                            action_targets_normed = self.waypoint_encoder.encode(action_targets)
+                            per_elem = (action_preds_normed - action_targets_normed).abs() # L1 loss on normalized action
+                            action_preds = self.waypoint_encoder.decode(action_preds_normed) # denomarlize the action for real action
                     else:  # huber
                         delta = 1.0
-                        diff = (action_preds - action_targets).abs()
-                        per_elem = torch.where(diff < delta, 0.5 * diff**2, delta * (diff - 0.5 * delta))
+                        if not self.use_waypoint_encoder:
+                            diff = (action_preds - action_targets).abs()
+                            per_elem = torch.where(diff < delta, 0.5 * diff**2, delta * (diff - 0.5 * delta))
+                        else:
+                            action_preds_normed = action_preds # we expect the network output is the action value between [-1, 1]
+                            action_targets_normed = self.waypoint_encoder.encode(action_targets)
+                            diff = (action_preds_normed - action_targets_normed).abs()
+                            per_elem = torch.where(diff < delta, 0.5 * diff**2, delta * (diff - 0.5 * delta))
+                            action_preds = self.waypoint_encoder.decode(action_preds_normed) # denomarlize the action for real action
+                            
+                            
 
                     # 只对 mask=True 的时间步求均值；若不同维度重要性不同可加权
                     per_elem = per_elem * mask_t  # [B,N,A]
+                    # print('mask_t ', mask_t)
+                    # print('perelem: ', per_elem)
                     denom = mask_t.sum() * action_preds.shape[-1] + 1e-8
+                    # print('denom',denom)
                     action_loss = per_elem.sum() / denom
+                
+                else: # action_target is None, for inference only
+                    action_preds = self.waypoint_encoder.decode(action_preds)
+                    action_loss = None
 
 
         lm_loss = out.loss if compute_lm_loss else None

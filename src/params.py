@@ -57,6 +57,11 @@ class TrainingArguments(HFTrainingArguments):
     lora_namespan_exclude: str = field(default=None, metadata={"help": "List of namespan to exclude for LoRA"})
     num_lora_modules: int = -1
     use_liger: bool = True
+    
+    action_lr: Optional[float] = field(default=None, metadata={"help": "统一的 action 学习率（head 和 token 都用），与下面两个二选一"})
+    action_head_lr: Optional[float] = field(default=None, metadata={"help": "action_head 的学习率（优先级高于 action_lr）"})
+    action_token_lr: Optional[float] = field(default=None, metadata={"help": "action_token_embeds 的学习率（优先级高于 action_lr）"})
+    action_weight_decay: Optional[float] = field(default=None, metadata={"help": "action 组的 weight decay；缺省时用全局 weight_decay"})
 
 @dataclass
 class DPOArguments(DPOConfigTRL):

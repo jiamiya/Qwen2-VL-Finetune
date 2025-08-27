@@ -1,15 +1,15 @@
 
 import os
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-os.environ["CUDA_VISIBLE_DEVICES"] = '5' 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"  
+# os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+# os.environ["CUDA_VISIBLE_DEVICES"] = '5' 
+# os.environ["TOKENIZERS_PARALLELISM"] = "false"  
 import torch
 from peft import LoraConfig, get_peft_model
 from peft.tuners.lora import LoraLayer
 import ast
 from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2VLForConditionalGeneration, HfArgumentParser, Qwen2_5_VLForConditionalGeneration
 from src.model.qwen2_5_vla import QwenVLAWrapper
-from src.trainer import QwenSFTTrainer
+from src.trainer import QwenSFTTrainer, QwenVLATrainer
 from src.dataset import make_supervised_vla_data_module
 from src.params import DataArguments, ModelArguments, TrainingArguments
 from train.train_utils import get_peft_state_maybe_zero_3, get_peft_state_non_lora_maybe_zero_3, safe_save_model_for_hf_trainer
@@ -235,8 +235,14 @@ def train():
                     pass
 
     # check trainable parameters
-    trainable = [(n, p.requires_grad, tuple(p.shape)) for n, p in model.named_parameters() if p.requires_grad]
-    print(f"#trainable params: {sum(p.numel() for _, p in trainable):,}")
+    trainable_params = [p for n, p in model.named_parameters() if p.requires_grad]
+    trainable_info = [(n, p.requires_grad, tuple(p.shape)) for n, p in model.named_parameters() if p.requires_grad]
+
+
+    # Optional: print debug info
+    # for name, requires_grad, shape in trainable_info:
+    #     print(f"{name}: requires_grad={requires_grad}, shape={shape}")
+    print(f"#trainable params: {sum(p.numel() for p in trainable_params):,}")
 
     # ==========================================================
     # 3) 数据与 Trainer（保持原逻辑）
@@ -250,13 +256,25 @@ def train():
         data_args=data_args
     )
 
-    from src.trainer import QwenSFTTrainer  # 你的自定义 Trainer
-    trainer = QwenSFTTrainer(
+    trainer = QwenVLATrainer(
         model=model,
         processing_class=processor,
         args=training_args,
         **data_module
     )
+    
+    import math
+    dl = trainer.get_train_dataloader()
+    num_batches = len(dl)
+    gas = training_args.gradient_accumulation_steps
+    updates_per_epoch = math.ceil(num_batches / gas)
+
+    print(f"[DEBUG] len(dataset)={len(trainer.train_dataset)}")
+    print(f"[DEBUG] num_batches_per_epoch={num_batches}")
+    print(f"[DEBUG] gradient_accumulation_steps={gas}")
+    print(f"[DEBUG] num_update_steps_per_epoch={updates_per_epoch}")
+    print(f"[DEBUG] num_train_epochs={training_args.num_train_epochs}  max_steps={training_args.max_steps}")
+
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

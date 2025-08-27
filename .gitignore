@@ -162,6 +162,8 @@ cython_debug/
 #.idea/
 
 output
+results
+data
 tf-logs
 tmp/
 scripts_tmp/
